@@ -1,5 +1,6 @@
 testing/
 *.o
+*.so
 
-
+compile_commands.json
 
