@@ -79,10 +79,13 @@ class WikiTable:
         while True:
             line, head = consume_line(head)
             line = line.lstrip()
+
             
             # handle end of tables/files
             if head is None or line.lstrip().startswith("|}"):
                 break
+
+
             # handle invalid lines
             if line[0] != '!' and line[0] != '|' and len(line.strip()) != 0:
                 if len(curRow) == 0:
@@ -91,11 +94,11 @@ class WikiTable:
                     curRow[-1].content += "\n" + line
                 continue
 
-            isHeader = line[0] == "!"
+            isHeader = line and line[0] == "!"
             line = line[1:].lstrip()
             
             # handle new rows
-            if line[0] == "-":
+            if line and line[0] == "-":
                 width = max(width, x - 1)
 
                 assert not isHeader
