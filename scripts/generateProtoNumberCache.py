@@ -39,7 +39,7 @@ def main():
 
 
     f = open(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "protoNums.json")
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "../data/protoNums.json")
         , "w")
     
     f.write(json.dumps(out, indent=2))
