@@ -1,3 +1,28 @@
+"""
+A powerful tool for parsing packets from the Packet section of the minecraft wiki,
+originally from wiki.vg.
+
+Wiki url: https://minecraft.wiki/w/Minecraft_Wiki:Protocol_documentation
+
+Copyright (C) 2025 - PsychedelicPalimpsest
+
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+
+
 from typing import *
 import requests
 from dataclasses import dataclass
@@ -100,14 +125,15 @@ class WikiTable:
             while True:
                 if line.startswith("colspan="):
                     cellColspan = int(line.split('"')[1])
-                    line = line[line.find('"'):]
-                    line = line[line.find('"'):].lstrip()
+                    line = line[line.find('"') + 1:]
+                    line = line[line.find('"') + 1:].lstrip()
                 elif line.startswith("rowspan="):
                     cellRowspan = int(line.split('"')[1])
-                    line = line[line.find('"'):]
-                    line = line[line.find('"'):].lstrip()
+                    line = line[line.find('"') + 1:]
+                    line = line[line.find('"') + 1:].lstrip()
                 else:
                     break
+
             if line.startswith('|'):
                 line=line[1:].lstrip()
             
@@ -192,21 +218,149 @@ class WikiTable:
         
 
 
+    def get(self, x : int, y : int) -> None | WikitableCell:
+        l = [cell for cell in  self.rows[y] if cell.x == x]
+        return None if len(l) == 0 else l[0]
 
 
 
 
 
+class ProtocolNode:
+    def debug_str(self) -> str:
+        raise NotImplemented("Not implmented")
 
+class ProtocolStrType(ProtocolNode):
 
+    def __init__(self, txt : str) -> None:
+        self.txt = txt
+    def debug_str(self) -> str:
+        return self.txt
 
-class ProtocolType:
+class ProtocolTypeBinary(ProtocolNode):
+    def __init__(self, descriptor : ProtocolNode, content : ProtocolNode) -> None:
+        self.descriptor = descriptor
+        self.content = content
+    def debug_str(self) -> str:
+        return self.descriptor.debug_str() + " & " + self.content.debug_str()
+
+class ProtocolList(ProtocolNode):
+
     # A str of unresolver or primative
-    fields : List[Tuple[str, 'str | ProtocolType']]
+    fields : List[Tuple[str, ProtocolNode]]
 
-    def __init__(self, fields : List[Tuple[str, 'str | ProtocolType']]):
+    def __init__(self, fields):
         self.fields = fields
+    def debug_str(self) -> str:
+        return "{\n\t" + ("\n\t".join(
+            (f"{name} : {tp.debug_str().replace('\n', '\n\t')}"   for name, tp in self.fields)
+        )) + "\n}"
+
+
+class Wiki:
+
+    name : str
+    components : List['Wiki | str']
+    def __init__(self, name, components) -> None:
+        self.name = name
+        self.components = components
+    def debug(self) -> str:
+        return f"{self.name}[{',\n'.join( (("Content of len: " + str(len(component)) if type(component) is str else component.debug()) for component in self.components))}]".replace("\n", "\n\t")
+
+
+    @classmethod
+    def From_oldid(cls, oldid : int, lvl : int = 0) -> 'Wiki':
+        jso = requests.get(BASE_URL.format(oldid )).json()
+        wikiContent = jso["query"]["pages"]["290319"]["revisions"][0]["slots"]["main"]["*"]
+        
+        # WARNING: This is a bad assumption
+        segments = wikiContent.split("\n=")
+        
+        # Initial segment is not part of anything
+        components = [segments[0]]
+        segments = segments[1:]
+
+
+        stack = [(-1, Wiki("root", components))]
+
+        for segment in segments:
+            # Another HORRIBLE asssumption
+            deph = segment.find(' ')
+            assert deph != -1
+
+            contentStart = segment.find('\n')
+            content = '' if contentStart == -1 else segment[contentStart:].strip() 
+
+            name = segment[deph:]
+            name = name.split('=')[0]
+
+
+            wiki = Wiki(name, [content])
+
+
+            while deph <= stack[-1][0]:
+                stack.pop(-1)
+
+            stack[-1][1].components.append(wiki)
+            stack.append((deph, wiki))
+        print(stack[1][1].components[0])
+        return stack[0][1]
+
+
+ 
+class TypeGenCtx:
+
     
+    def __init__(self):
+        pass
+    
+    def parse_type_content(self, type_content : str) -> ProtocolNode:
+        # TODO: THIS
+        return ProtocolStrType(type_content)
+
+    def parse_subtable(self, name_col : WikiTable, type_col : WikiTable) -> ProtocolList:
+        # As a rule, the names column needs to be symetric with the type table
+        assert name_col.width == type_col.width, ValueError("Symmetry violation")
+        assert name_col.height == type_col.height, ValueError("Symmetry violation")
+
+        fields = []
+
+        row_itr = zip(name_col.rows, type_col.rows)
+        for name_row, type_row in row_itr:
+            assert len(name_row) == len(type_row), ValueError("Symmetry violation") 
+
+            if len(name_row) == 0:
+                continue
+            # Simple types
+            elif len(name_row) == 1:
+                fields.append((name_row[0].content, self.parse_type_content(type_row[0].content)))
+            else:
+                # The first elements rowspan tells us how long the recusive type is
+                assert name_row[0].rowspan == type_row[0].rowspan, ValueError("Symmetry violation")
+                fields.append((
+                    name_row[0].content,
+                    ProtocolTypeBinary(
+                        self.parse_type_content(type_row[0].content),
+                        self.parse_subtable(
+                            name_col.subtable(name_row[0].colspan, name_row[0].y, height=name_row[0].rowspan),
+                            type_col.subtable(name_row[0].colspan, name_row[0].y, height=name_row[0].rowspan)
+                        )
+                    )
+                ))
+                # Now consume N rows
+                for _ in range(name_row[0].rowspan):
+                    next(row_itr)
+        return ProtocolList(
+           fields 
+        )
+        
+
+
+
+
+
+
+   
 
 
 test = """
@@ -287,8 +441,9 @@ test = """
 """
 
 if __name__ == "__main__":
-    #jso = requests.get(BASE_URL.format(3024144)).json()
-    #wikiContent = jso["query"]["pages"]["290319"]["revisions"][0]["slots"]["main"]["*"]
+    wiki = Wiki.From_oldid(3024144)
+    # ctx = TypeGenCtx()
+    #tbl = WikiTable.From_txt(test)
 
-    #print(wikiContent)
-    WikiTable.From_txt(test).subtable(0, 0).debug_print()
+    #print(ctx.parse_subtable(tbl.subtable(3, 1, width=2), tbl.subtable(5, 1, width=2)).debug_str())
+
