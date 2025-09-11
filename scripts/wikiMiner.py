@@ -59,8 +59,16 @@ class WikiTable:
         self.width = width
         self.height = height
     @classmethod
-    def From_txt(cls, txt : str) -> 'WikiTable':
-        txt = txt.strip()
+    def From_txt(cls, txt : str) -> Tuple['WikiTable', str | None]:
+        """
+        Parse a standered wikitable, where txt is at the start if the wikitable (With allowence for whitespace).
+        
+
+        :return: A tuple, the first element being the parsed table obj, the secound being the rest of
+                 the string after the table (None if EOS). 
+        """
+
+        txt = txt.lstrip()
 
         rows = []
         curRow = []
@@ -85,6 +93,8 @@ class WikiTable:
             if head is None or line.lstrip().startswith("|}"):
                 break
 
+            if not len(line):
+                continue
 
             # handle invalid lines
             if line[0] != '!' and line[0] != '|' and len(line.strip()) != 0:
@@ -99,6 +109,11 @@ class WikiTable:
             
             # handle new rows
             if line and line[0] == "-":
+                if y == 0 and len(curRow) == 0:
+                    # WTF??????
+                    continue
+
+
                 width = max(width, x - 1)
 
                 assert not isHeader
@@ -158,13 +173,18 @@ class WikiTable:
         # last row edgecase
         rows.append(curRow)
 
+
+
         height = len(rows)
 
         return WikiTable(
             rows,
             width,
             height
-        )
+        ), head
+
+
+
 
     def debug_print(self, colWidth = 5, rowHeight=2):
         """
@@ -212,7 +232,7 @@ class WikiTable:
                 real_width = max(real_width, cell.x + cell.colspan)
         return WikiTable(rows, real_width, len(rows))
         
-    def search_headers(self, predicate : Callable[[str], bool]):
+    def search_headers(self, predicate : Callable[[str], bool]) -> List[WikitableCell]:
         # Headers can only exist on the first row
         return [
             cell for cell in self.rows[0]
@@ -261,7 +281,6 @@ class ProtocolList(ProtocolNode):
 
 
 class Wiki:
-
     name : str
     components : List['Wiki | str']
     def __init__(self, name, components) -> None:
@@ -272,7 +291,7 @@ class Wiki:
 
 
     @classmethod
-    def From_oldid(cls, oldid : int, lvl : int = 0) -> 'Wiki':
+    def From_oldid(cls, oldid : int) -> 'Wiki':
         jso = requests.get(BASE_URL.format(oldid )).json()
         wikiContent = jso["query"]["pages"]["290319"]["revisions"][0]["slots"]["main"]["*"]
         
@@ -295,7 +314,7 @@ class Wiki:
             content = '' if contentStart == -1 else segment[contentStart:].strip() 
 
             name = segment[deph:]
-            name = name.split('=')[0]
+            name = name.split('=')[0].strip()
 
 
             wiki = Wiki(name, [content])
@@ -306,11 +325,14 @@ class Wiki:
 
             stack[-1][1].components.append(wiki)
             stack.append((deph, wiki))
-        print(stack[1][1].components[0])
+
+        assert type(stack[0][1]) is Wiki, "Wiki stack corruption"
         return stack[0][1]
+    
 
+class SymmetryError(Exception):
+    pass
 
- 
 class TypeGenCtx:
 
     
@@ -322,15 +344,31 @@ class TypeGenCtx:
         return ProtocolStrType(type_content)
 
     def parse_subtable(self, name_col : WikiTable, type_col : WikiTable) -> ProtocolList:
-        # As a rule, the names column needs to be symetric with the type table
-        assert name_col.width == type_col.width, ValueError("Symmetry violation")
-        assert name_col.height == type_col.height, ValueError("Symmetry violation")
+        # Generally a, a type is symmetric across the table, with violation of this
+        # rule either being an indication of a special condition, or a formatting
+        # error on the part of the wiki editors. 
+
+        # Only check height, as width can change with Enums
+        if name_col.height != type_col.height: raise SymmetryError()
 
         fields = []
 
         row_itr = zip(name_col.rows, type_col.rows)
         for name_row, type_row in row_itr:
-            assert len(name_row) == len(type_row), ValueError("Symmetry violation") 
+
+            if len(name_row) != len(type_row):
+                # When this happens typically there is a formatting
+                # issue on the Wiki itself, exept in the 'no fields' condition
+                if len(name_row) and name_row[0].content.strip() == "''no fields''":
+                    # Now consume N rows
+                    for _ in range(name_row[0].rowspan):
+                        try: next(row_itr)
+                        except StopIteration: break
+                    continue
+#                 elif len(name_row) and name_row[0].content.strip() == "Action" and name_row[0].isHeader:
+
+                else:
+                    raise SymmetryError()
 
             if len(name_row) == 0:
                 continue
@@ -339,7 +377,7 @@ class TypeGenCtx:
                 fields.append((name_row[0].content, self.parse_type_content(type_row[0].content)))
             else:
                 # The first elements rowspan tells us how long the recusive type is
-                assert name_row[0].rowspan == type_row[0].rowspan, ValueError("Symmetry violation")
+                if name_row[0].rowspan != type_row[0].rowspan: raise SymmetryError()
                 fields.append((
                     name_row[0].content,
                     ProtocolTypeBinary(
@@ -352,13 +390,174 @@ class TypeGenCtx:
                 ))
                 # Now consume N rows
                 for _ in range(name_row[0].rowspan):
-                    next(row_itr)
+                    try: next(row_itr)
+                    except StopIteration: break
         return ProtocolList(
            fields 
         )
+
+class Packet:
+
+    def __init__(self, preamble : str, packetId : str, resourceId : str | None, typeDefinition : ProtocolList) -> None:
+        """
+        :param preamble: The description the wiki gives before the definition, this is often blank (zero len)
+        :param packetId: The hex byte used to identify the packet on the network
+        :param resourceid: The name Minecraft knows it by, this is absent (set to None) for older version
+        :param typeDefinition: The parsed type object for this packet 
+        """
+
+
+
+        self.preamble = preamble
+        self.packetId = packetId
+        self.resourceId = resourceId
+        self.typeDefinition = typeDefinition
+
+
+def parse_modern_packet_id(id_col : str) -> Dict[str, str]:
+    # Example packet id:
+    # ''protocol:''<br/><code>0x00</code><br/><br/>''resource:''<br/><code>intention</code>
+    # Which tend to follow the format:
+    # [''{Key}:''<br/><code>{Value}</code><br/><br/>]
+
+    ret = {}
+    txt = id_col
+
+
+    # Fix for: Legacy Server List Ping
+    # Likely to be seen earlier
+    if id_col.startswith("0x"):
+        return {"protocol": id_col}
+
+    while txt:
+        assert txt.startswith("''"), f"Packet id format error, see: {id_col}"
+        txt = txt[2:]
+        nameEnd = txt.find(":''")
+
+        assert nameEnd != -1
+
+        name = txt[:nameEnd]
         
+        # Skip br
+        txt = txt[txt.find(">") +1: ]
+
+        assert txt.startswith("<code>")
+        txt = txt[len("<code>"):]
+        value = txt[:txt.find("<")]
 
 
+        # Skip to </code>
+        txt = txt[txt.find(">") +1: ]
+        while txt and txt.startswith("<br"):
+            # Skip brs
+            txt = txt[txt.find(">") +1: ]
+
+        ret[name] = value
+    return ret
+
+
+
+def modern_packet_parse(packet : Wiki, ctx : TypeGenCtx):
+    assert len(packet.components)
+
+    txt = packet.components[0]
+    name = packet.name
+
+    assert type(txt) is str
+
+    preamble = ""
+    
+    # Create the preamble and seek txt to first table
+    while txt:
+        line, head = consume_line(txt)
+
+        if line.startswith("{|"):
+            break
+
+        txt = head
+        preamble += line + "\n"
+
+    if txt is None or not len(txt):
+        raise Exception(f"Cannot find packet table for {packet.name}. Intervention required!")
+
+    packetTable, txt = WikiTable.From_txt(txt)
+
+
+    if packetTable.get(0, 0).content.strip() != "Packet ID":
+        raise Exception(f"Packet {packet.name} not of expected packet table format. Intervention required!")
+
+    packetId = parse_modern_packet_id(packetTable.get(0, 1).content)
+    assert "protocol" in packetId
+
+    nameHeader = packetTable.search_headers(lambda cont: cont.strip() == "Field Name")
+    typeHeader = packetTable.search_headers(lambda cont: cont.strip() == "Field Type")
+
+
+    assert 1 == len(nameHeader)
+    assert 1 == len(typeHeader)
+
+    nameCol = packetTable.subtable(nameHeader[0].x, 1, width=nameHeader[0].colspan)
+    typeCol = packetTable.subtable(typeHeader[0].x, 1, width=typeHeader[0].colspan)
+
+    try:
+        packetType = ctx.parse_subtable(nameCol, typeCol)
+    except SymmetryError as e: 
+        print(f"Symmetry error in packet {packet.name}. Intervention required!")
+        return None
+ #       raise e
+    except Exception as e:
+        print(f"Unknown exception condition in {packet.name}. Intervention required!")
+        raise e
+    return Packet(
+        preamble,
+        packetId["protocol"],
+        packetId.get("resource"),
+        packetType
+    )
+
+
+
+
+
+MODERN_WIKI_WHITELIST = ["Status", "Login", "Handshaking", "Configuration", "Play"]        
+MODERN_WIKI_IGNORELIST = ["Definitions", "Packet format", "Navigation"]
+def modern_wiki_parse(root : Wiki, ):
+    assert root.name == "root"
+
+    ctx = TypeGenCtx()
+
+    for packet_mode_tree in root.components:
+        if type(packet_mode_tree) is str:
+            continue
+
+        if packet_mode_tree.name in MODERN_WIKI_IGNORELIST:
+            continue
+
+        if not packet_mode_tree.name in MODERN_WIKI_WHITELIST:
+            # We only allow defined headers to ENSURE we understand what we are doing
+            raise Exception(f"Unknown wiki header '{packet_mode_tree.name}'")
+
+        packet_mode_ret = {}
+
+        for destination in packet_mode_tree.components:
+            if type(destination) is str:
+                continue
+        
+            assert destination.name in ["Clientbound", "Serverbound"], f"Unknown destination {destination.name}"
+
+            packet_wikis : List[Wiki] = [c for c in destination.components if type(c) is not str]
+            
+            packets = [modern_packet_parse(w, ctx) for w in packet_wikis]
+             
+
+
+                        
+            
+    
+            
+        
+        
+        
 
 
 
@@ -445,6 +644,8 @@ test = """
 
 if __name__ == "__main__":
     wiki = Wiki.From_oldid(3024144)
+    modern_wiki_parse(wiki)
+    # wiki.parse_datatypes()
     # ctx = TypeGenCtx()
     #tbl = WikiTable.From_txt(test)
 
