@@ -55,11 +55,12 @@ true, false,
 # Strings
 "Some complex string \"with escapes\"",
 
-"Multi line strings too! \
-Note: This is C style, so \n's are needed \
-to add newlines. \
 "
-
+  Multi line strings
+  just work
+  as one would 
+  expect!
+"
 
 
 
