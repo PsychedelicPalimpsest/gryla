@@ -1,5 +1,4 @@
 # Gryla
 
-A work in progress implmentation of the Minecraft Network protocol
-
+The minecraft network documenting project.
 

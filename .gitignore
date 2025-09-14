@@ -1,10 +1,4 @@
-testing/
-*.o
-*.so
 *__pycache__/
 # Mediawiki dumps
 *.wiki
-
-# Bear auto complete
-compile_commands.json
 
