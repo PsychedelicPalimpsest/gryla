@@ -1,4 +1,23 @@
+# This file is part of the Gryla project
 # Copyright (C) 2025 - PsychedelicPalimpsest
+#
+# You are free to copy, redistribute, and/or modify this file
+# under the terms of the CC BY-SA 4.0 license, as published by
+# Creative Commons, either version 4.0 of the License, or (at
+# your option) any later version.
+#
+# This file is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty
+# of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the CC BY-SA 4.0 license for more details.
+#
+# You should have received a copy of the CC BY-SA 4.0 license
+# along with this file. If not, see <https://creativecommons.org/licenses/by-sa/4.0/>.
+
+
+
+
+
 # The proto file format is a relatively simple DSL designed for use in defining the schema 
 # for Minecraft packets. It is in NO WAY official, or connected with Mojang. It is of my own creation.
 
