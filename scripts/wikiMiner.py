@@ -241,6 +241,7 @@ class WikiTable:
         
 
 
+
     def get(self, x : int, y : int) -> None | WikitableCell:
         l = [cell for cell in  self.rows[y] if cell.x == x]
         return None if len(l) == 0 else l[0]
@@ -261,11 +262,36 @@ class ProtocolStrType(ProtocolNode):
         return self.txt
 
 class ProtocolTypeBinary(ProtocolNode):
-    def __init__(self, descriptor : ProtocolNode, content : ProtocolNode) -> None:
+    def __init__(self, descriptor : ProtocolNode, content : ProtocolNode, isEnum = False) -> None:
         self.descriptor = descriptor
         self.content = content
+        self.isEnum = isEnum
     def debug_str(self) -> str:
         return self.descriptor.debug_str() + " & " + self.content.debug_str()
+
+class ProtocolAnnotation(ProtocolNode):
+    def __init__(self, annotated : ProtocolNode, annotation : str):
+        self.annotated = annotated
+        self.annotation = annotation
+    def debug_str(self) -> str:
+        return self.annotated.debug_str()
+
+class ProtocolConditionalOption(ProtocolNode):
+    def __init__(self, condition : int, content : ProtocolNode):
+        self.condition = condition
+        self.content = content
+    def debug_str(self) -> str:
+        return f"when {self.condition} : {self.content.debug_str().replace('\n', '\n\n')}"
+class ProtocolConditional(ProtocolNode):
+    def __init__(self, conditions : List[ProtocolConditionalOption]) -> None:
+        self.conditions = conditions
+
+    def debug_str(self) -> str:
+        return "{\n\t" + ("\n\t".join(
+            (f"{cond.debug_str().replace('\n', '\n\t')}" for cond in self.conditions)
+        )) + "\n}"
+
+
 
 class ProtocolList(ProtocolNode):
 
@@ -334,16 +360,15 @@ class SymmetryError(Exception):
     pass
 
 class TypeGenCtx:
-
-    
-    def __init__(self):
-        pass
+    proto_version : int
+    def __init__(self, proto_version : int):
+        self.proto_version = proto_version
     
     def parse_type_content(self, type_content : str) -> ProtocolNode:
         # TODO: THIS
         return ProtocolStrType(type_content)
 
-    def parse_subtable(self, name_col : WikiTable, type_col : WikiTable) -> ProtocolList:
+    def parse_subtable(self, name_col : WikiTable, type_col : WikiTable, forceEnumStyleAfter : int | None = None) -> ProtocolList:
         # Generally a, a type is symmetric across the table, with violation of this
         # rule either being an indication of a special condition, or a formatting
         # error on the part of the wiki editors. 
@@ -355,18 +380,53 @@ class TypeGenCtx:
 
         row_itr = zip(name_col.rows, type_col.rows)
         for name_row, type_row in row_itr:
-
             if len(name_row) != len(type_row):
                 # When this happens typically there is a formatting
                 # issue on the Wiki itself, exept in the 'no fields' condition
                 if len(name_row) and name_row[0].content.strip() == "''no fields''":
                     # Now consume N rows
-                    for _ in range(name_row[0].rowspan):
+                    for _ in range(name_row[0].rowspan - 1):
                         try: next(row_itr)
                         except StopIteration: break
-                    continue
-#                 elif len(name_row) and name_row[0].content.strip() == "Action" and name_row[0].isHeader:
 
+                    continue
+
+                # The only time a mid-content header is seen _should_ be enums with conditional content.
+                # However some exceptional packets lack this header
+                elif len(name_row) > 1 and (
+                        name_row[0].isHeader or (
+                            forceEnumStyleAfter is not None and forceEnumStyleAfter == name_row[0].y
+                            )):
+                    enumContents = []
+                    while True:
+                        try:
+                            name_row, type_row = next(row_itr) if forceEnumStyleAfter is None else (name_row, type_row)
+                            # Evil hack
+                            forceEnumStyleAfter = None
+
+                            assert len(name_row) == 2, "We do not support an enum conditional field that is not at an end of a list, or has multiple layers (TODO)"
+                            enumContents.append(ProtocolConditionalOption(
+                                int(name_row[0].content.split(":")[0]),
+                                ProtocolAnnotation(
+
+                                        
+                                    self.parse_subtable(
+                                        name_col.subtable(name_row[1].x, name_row[1].y, height=name_row[0].rowspan),
+                                        type_col.subtable(type_row[0].x, name_row[1].y, height=name_row[0].rowspan)
+                                    ) if len(type_row) and name_row[1] != "''no fields''"
+                                      else ProtocolList([]),
+                                    name_row[0].content,
+                                )
+                            ))
+                            for _ in range(name_row[0].rowspan - 1):
+                                next(row_itr)
+
+
+                        except StopIteration:
+                            break
+                    fields.append(("Actions", ProtocolConditional(enumContents)))
+                    # Todo: Support enums that are not the end of a list
+                    break
                 else:
                     raise SymmetryError()
 
@@ -412,6 +472,66 @@ class Packet:
         self.packetId = packetId
         self.resourceId = resourceId
         self.typeDefinition = typeDefinition
+    def debug_str(self) -> str:
+        return f"# {self.preamble}]\n# {self.packetId} & {self.resourceId}\n{self.typeDefinition.debug_str()}"
+
+@dataclass
+class PacketPatch:
+    name : str
+    proto_range : range
+
+    patch_table : Callable[[WikiTable, 'PacketPatch'], WikiTable] | None = None
+    forced_version : Dict | None = None
+    post_parse_mod : Callable[[ProtocolList, WikiTable, WikiTable, Wiki, 'PacketPatch'], None] | None = None
+
+
+
+    force_enum_after : int | None = None
+
+    debug : bool = False
+    disabled : bool = False
+
+    # Use to store anything you want
+    storage : Any = None
+
+
+class PatchSet:
+    patches : List[PacketPatch]
+    name_lookup : Dict[str, List[PacketPatch]]
+    DEFAULT = PacketPatch("DEFAULT", range(0)) 
+    def __init__(self, *patches : PacketPatch) -> None:
+        self.patches = list(patches)
+        self.name_lookup = {}
+
+        for p in patches:
+            if not p.name in self.name_lookup:
+                self.name_lookup[p.name] = []
+            self.name_lookup[p.name].append(p)
+
+    def resolve_patch(self, name : str, proto : int) -> PacketPatch:
+        if not name in self.name_lookup:
+            return self.DEFAULT
+        for patch in self.name_lookup[name]:
+            if proto in patch.proto_range:
+                return patch
+        return self.DEFAULT
+
+
+def _waypoint_post_parse_patch(proto_list, table, raw_table, wiki, patch):
+    pass
+# Due to it being a wiki, not all packets are 
+# perfectly formatted. So they need patched
+PACKET_PATCHES = PatchSet(
+    # Non standered
+    PacketPatch("Player Chat Message", range(999), disabled=True),
+
+    PacketPatch("Update Teams", range(999), force_enum_after=2),
+    PacketPatch("Waypoint", range(999), 
+                patch_table=lambda table, _: table.subtable(0, 0, height=4),
+                debug=True
+
+                )
+)
 
 
 def parse_modern_packet_id(id_col : str) -> Dict[str, str]:
@@ -428,6 +548,8 @@ def parse_modern_packet_id(id_col : str) -> Dict[str, str]:
     # Likely to be seen earlier
     if id_col.startswith("0x"):
         return {"protocol": id_col}
+
+
 
     while txt:
         assert txt.startswith("''"), f"Packet id format error, see: {id_col}"
@@ -457,8 +579,12 @@ def parse_modern_packet_id(id_col : str) -> Dict[str, str]:
 
 
 
-def modern_packet_parse(packet : Wiki, ctx : TypeGenCtx):
+def modern_packet_parse(packet : Wiki, ctx : TypeGenCtx) -> Packet:
     assert len(packet.components)
+
+    patch = PACKET_PATCHES.resolve_patch(packet.name, ctx.proto_version)
+
+
 
     txt = packet.components[0]
     name = packet.name
@@ -480,14 +606,37 @@ def modern_packet_parse(packet : Wiki, ctx : TypeGenCtx):
     if txt is None or not len(txt):
         raise Exception(f"Cannot find packet table for {packet.name}. Intervention required!")
 
-    packetTable, txt = WikiTable.From_txt(txt)
+    packetTableRaw, txt = WikiTable.From_txt(txt)
+    packetTable = packetTableRaw
+    
+    if patch.patch_table:
+        packetTable = patch.patch_table(packetTable, patch)
 
 
     if packetTable.get(0, 0).content.strip() != "Packet ID":
         raise Exception(f"Packet {packet.name} not of expected packet table format. Intervention required!")
+    
+    packetId = (
+        parse_modern_packet_id(packetTable.get(0, 1).content)
+        if patch.forced_version is None
+        else patch.forced_version
+    )
 
-    packetId = parse_modern_packet_id(packetTable.get(0, 1).content)
     assert "protocol" in packetId
+
+
+
+    if patch.disabled:
+        p = Packet(
+            "DISABLED WIKI PACKET", 
+            packetId["protocol"],
+            packetId.get("resource"),
+            ProtocolList([])
+        )
+        if patch.debug: print(p.debug_str())
+        return p
+
+
 
     nameHeader = packetTable.search_headers(lambda cont: cont.strip() == "Field Name")
     typeHeader = packetTable.search_headers(lambda cont: cont.strip() == "Field Type")
@@ -500,15 +649,23 @@ def modern_packet_parse(packet : Wiki, ctx : TypeGenCtx):
     typeCol = packetTable.subtable(typeHeader[0].x, 1, width=typeHeader[0].colspan)
 
     try:
-        packetType = ctx.parse_subtable(nameCol, typeCol)
+        packetType = ctx.parse_subtable(nameCol, typeCol, forceEnumStyleAfter=patch.force_enum_after)
     except SymmetryError as e: 
         print(f"Symmetry error in packet {packet.name}. Intervention required!")
+        print(packet.components[0])
+        print("\n\n")
         return None
  #       raise e
     except Exception as e:
         print(f"Unknown exception condition in {packet.name}. Intervention required!")
         raise e
-    return Packet(
+   
+
+    if patch.post_parse_mod:
+        patch.post_parse_mod(packetType, packetTable, packetTableRaw, packet, patch)
+
+
+    p = Packet(
         preamble,
         packetId["protocol"],
         packetId.get("resource"),
@@ -518,13 +675,20 @@ def modern_packet_parse(packet : Wiki, ctx : TypeGenCtx):
 
 
 
+    if patch.debug: print(p.debug_str())
+    return p
+
+
+
+
+
 
 MODERN_WIKI_WHITELIST = ["Status", "Login", "Handshaking", "Configuration", "Play"]        
 MODERN_WIKI_IGNORELIST = ["Definitions", "Packet format", "Navigation"]
-def modern_wiki_parse(root : Wiki, ):
+def modern_wiki_parse(root : Wiki, proto_version : int):
     assert root.name == "root"
 
-    ctx = TypeGenCtx()
+    ctx = TypeGenCtx(proto_version)
 
     for packet_mode_tree in root.components:
         if type(packet_mode_tree) is str:
@@ -644,7 +808,7 @@ test = """
 
 if __name__ == "__main__":
     wiki = Wiki.From_oldid(3024144)
-    modern_wiki_parse(wiki)
+    modern_wiki_parse(wiki, 772)
     # wiki.parse_datatypes()
     # ctx = TypeGenCtx()
     #tbl = WikiTable.From_txt(test)

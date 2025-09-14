@@ -24,15 +24,86 @@ from string import digits, ascii_letters, punctuation, whitespace, hexdigits
 
 from io import StringIO
 
+from dataclasses import dataclass, replace
+
+
+@dataclass(frozen=True)
+class SerializationCtx:
+    # ===== Formatting settings =====
+    
+    # Strip out comments, even if they were parsed
+    # Note: If False, will not be able to get them back if they were not parsed
+    DO_STRIP_COMMENTS : bool = False
+    DO_INDENTATION : bool = True
+    DO_LEADING_COMMA : bool = True
+
+    # Do non-required new lines
+    DO_NEWLINE : bool = True
+
+    INDENTATION_MULTIPLIER : int = 4
+
+
+    ONELINER_THRESHOLD : int = 4
+
+    
+    # Parsing context vars
+
+    indentation_level : int = 0
+    
+
+
+    def mutate_for_oneliner(self) -> 'SerializationCtx':
+        return replace(self, DO_NEWLINE = False)
+
+
+    def mutate_for_indentation(self) -> 'SerializationCtx':
+        return replace(self, indentation_level = self.indentation_level + 1 )
+
+    def indent(self) -> str:
+        return (" " * (self.indentation_level * self.INDENTATION_MULTIPLIER) ) if self.DO_INDENTATION else ""
+
+
+
 class ProtoNode:
     def __init__(self):
         raise Exception("CANNOT INIT BASE") 
 
-    def serialize(self, indentation : int = 0) -> str:
+
+    def determine_size(self) -> int:
+        """ Gives a value used to determine formatting size """
+        return 1
+    def contains_forces_forced_newline(self) -> bool:
+        return False
+
+    def style_comment(self) -> bool:
+        return False 
+
+    def serialize(self, ctx : SerializationCtx) -> str:
+        """
+        Serialize and format text. Must respect ctx.
+        Conventions:
+            - It is the callers responsibility to handle what comes next
+            - The indentation returned by ctx.indent() is that which _WAS_
+              used to indent that item to the CURRENT LEVEL. 
+            - Assume this item is currently indented
+            - The SerializationCtx is all the function knows or cares about
+
+        """
         raise Exception("Not implmented")
 
     @classmethod
-    def Deserialize(cls, stream : StringIO) -> 'ProtoNode':
+    def Deserialize(cls, stream : StringIO, allow_comments = False) -> 'ProtoNode':
+        """
+        Parse from string. 
+
+        Conventions: 
+            - Stream should be set the first char of the token
+            - At return the stream should be put directly at the 
+              of the thing being parsed. It it the callers responsibility
+              to handle ws
+
+
+        """
         raise Exception("Not implmented")
 
 class ProtoString(ProtoNode):
@@ -70,11 +141,11 @@ class ProtoString(ProtoNode):
     def __init__(self, raw_contents : str):
         self.raw_contents = raw_contents
     
-    def serialize(self, indentation: int = 0) -> str:
+    def serialize(self, ctx: SerializationCtx) -> str:
         return f"\"{self.raw_contents}\""
 
     @classmethod
-    def Deserialize(cls, stream: StringIO) -> 'ProtoString':
+    def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
         raw = ""
 
         first = stream.read(1)
@@ -95,16 +166,17 @@ class ProtoNumber(ProtoNode):
     raw_contents : str
     
 
-    VALID_CONTENTS = hexdigits + "xX_." 
+    VALID_CONTENTS = hexdigits + "xXbB_.-" 
 
     def __init__(self, raw_contents : str):
         self.raw_contents = raw_contents
 
-    def serialize(self, indentation: int = 0) -> str:
+    def serialize(self, ctx: SerializationCtx) -> str:
         return self.raw_contents
     
+    
     @classmethod
-    def Deserialize(cls, stream: StringIO) -> 'ProtoNumber':
+    def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
         raw = ""
         while (c := stream.read(1)) in cls.VALID_CONTENTS and c != '':
             raw += c
@@ -123,7 +195,7 @@ class ProtoNumber(ProtoNode):
                     raise ValueError(f'Invalid number in binary mode: {c}')
         else:
             for c in raw:
-                if c not in digits + "_.":
+                if c not in digits + "-_.":
                     raise ValueError(f'Invalid number in decimal mode: {c}')
 
 
@@ -137,20 +209,26 @@ class ListStyle(enum.Enum):
 
     BRACKET = enum.auto()
 
+    # Not use within the nowmal protolist
+    CURLY_BRACKET = enum.auto()
+
 
     def end_token(self) -> str:
         return {
             self.ROOT: '',
             self.PARAM: ')',
-            self.BRACKET: ']'
+            self.BRACKET: ']',
+            self.CURLY_BRACKET: '}'
         }[self]
     
     def start_token(self) -> str:
         return {
             self.ROOT: '',
             self.PARAM: '(',
-            self.BRACKET: '['
+            self.BRACKET: '[',
+            self.CURLY_BRACKET: '{'
         }[self]
+
 class ProtoList(ProtoNode):
     style : ListStyle
     contents : List[ProtoNode]
@@ -158,17 +236,52 @@ class ProtoList(ProtoNode):
         self.style = style
         self.contents = contents
 
-    def serialize(self, indentation: int = 0) -> str:
-        out = self.style.start_token()
-        for c in self.contents:
-            out += '\n' + ('\t' * (indentation + 1) ) + c.serialize(indentation=indentation+1) + ","
+    def determine_size(self) -> int:
+        return max(1, len(self.contents)) + max((0, *(c.determine_size() for c in self.contents)))
 
-        out += ("\n" + ('\t' * indentation) if len(self.contents) else "") + self.style.end_token()
+    def contains_forces_forced_newline(self) -> bool:
+        return any((type(c) is ProtoComment for c in self.contents))
+
+    def serialize(self, ctx: SerializationCtx) -> str:
+        out = self.style.start_token()
+
+        # Determine if a oneliner is required
+        if self.determine_size() <= ctx.ONELINER_THRESHOLD:
+            ctx = ctx.mutate_for_oneliner()
+
+        had_previous_forced_nl = False
+        child_ctx_base = ctx.mutate_for_indentation()
+
+        for i, c in enumerate(self.contents):
+            if child_ctx_base.DO_STRIP_COMMENTS and c.style_comment():
+                continue
+
+
+            if child_ctx_base.DO_NEWLINE and not had_previous_forced_nl:
+                out += '\n'
+            if child_ctx_base.DO_NEWLINE:
+                out += child_ctx_base.indent()
+
+            out += c.serialize(child_ctx_base)
+            had_previous_forced_nl = c.style_comment()
+
+
+            
+            if not c.style_comment() and ((child_ctx_base.DO_LEADING_COMMA and child_ctx_base.DO_NEWLINE) or i+1 != len(self.contents) ):
+                out += ','
+                if not child_ctx_base.DO_NEWLINE:
+                    out += ' '
+            
+
+        if ctx.DO_NEWLINE:
+            out += '\n'
+            if ctx.DO_INDENTATION:
+                out += ctx.indent()
+        out += self.style.end_token()
         return out
 
-    
     @classmethod
-    def Deserialize(cls, stream: StringIO, force_root : bool = False) -> 'ProtoList':
+    def Deserialize(cls, stream: StringIO, allow_comments=False, force_root : bool = False) -> 'ProtoNode':
         first = stream.read(1) if not force_root else ''
 
         style = ListStyle.ROOT if force_root else {
@@ -192,7 +305,11 @@ class ProtoList(ProtoNode):
                 continue
 
             stream.seek(stream.tell() - 1)
-            contents.append(id.Deserialize(stream))
+            node = id.Deserialize(stream)
+
+            if not(type(node) is ProtoComment and not allow_comments):
+                contents.append(node)
+
 
             while (c := stream.read(1)) != ender and c != ',':
                 if c not in whitespace:
@@ -202,31 +319,34 @@ class ProtoList(ProtoNode):
         return ProtoList(contents, style) 
 
 
+class _ProtoKV(ProtoNode):
+    key : ProtoNode
+    value : ProtoNode
+    def __init__(self, key : ProtoNode, value : ProtoNode):
+        self.key = key
+        self.value = value
+
+    def determine_size(self) -> int:
+        return max(self.key.determine_size(), self.value.determine_size())
+    
+    @classmethod
+    def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
+        raise Exception("Cannot parse ProtoKV")
+
+    def serialize(self, ctx: SerializationCtx) -> str:
+        return self.key.serialize(ctx) + ": " + self.value.serialize(ctx)
 
 
-class ProtoDict(ProtoNode):
+class ProtoDict(ProtoList):
 
-    contents : List[Tuple[ProtoNode, ProtoNode]]
-    def __init__(self, contents : List[Tuple[ProtoNode, ProtoNode]]):
-        self.contents = contents
-
-    def serialize(self, indentation: int = 0) -> str:
-        out = '{'
-        for key, value in self.contents:
-            out += "\n"
-            out += '\t' * (indentation + 1)
-            out += key.serialize(indentation + 2)
-            out += ": "
-            out += value.serialize(indentation + 2)
-            out += ","
-        if self.contents:
-            out += "\n"
-        out += '\t' * indentation + "}"
-        return out
+    contents : List['_ProtoKV | ProtoComment']
+    def __init__(self, contents : List[Tuple[ProtoNode, ProtoNode] | 'ProtoComment']):
+        self.contents = [_ProtoKV(c[0], c[1]) if type(c) is tuple else c for c in contents]
+        self.style = ListStyle.CURLY_BRACKET
 
 
     @classmethod
-    def Deserialize(cls, stream: StringIO) -> 'ProtoDict':
+    def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
         assert stream.read(1) == '{'
 
         contents = []
@@ -244,6 +364,11 @@ class ProtoDict(ProtoNode):
             stream.seek(stream.tell() - 1)
 
             key : ProtoNode = k_id.Deserialize(stream)
+
+            if type(key) is ProtoComment:
+                if allow_comments:
+                    contents.append(key)
+                continue
             
             while (c := stream.read(1)) != ':':
                 assert c in whitespace, f"Unexpected token {c}"
@@ -258,17 +383,7 @@ class ProtoDict(ProtoNode):
         return ProtoDict(contents)
 
 
-
-
-
-            
-
-
-
-
-
 class ProtoType(ProtoNode):
-
     name : str
 
     attached_params : None | ProtoList
@@ -284,20 +399,38 @@ class ProtoType(ProtoNode):
         self.attached_list = attached_list
         self.attached_dict = attached_dict
 
-    def serialize(self, indentation: int = 0) -> str:
+    def determine_size(self) -> int:
+        return 1 + (
+            (self.attached_dict.determine_size() if self.attached_dict is not None else 0)
+            +
+            (self.attached_list.determine_size() if self.attached_list is not None else 0)
+            +
+            (self.attached_params.determine_size() if self.attached_params is not None else 0)
+        )
+    def contains_forces_forced_newline(self) -> bool:
+        return any(
+            self.attached_params is not None and self.attached_params.contains_forces_forced_newline(),
+            self.attached_list is not None and self.attached_list.contains_forces_forced_newline(),
+            self.attached_dict is not None and self.attached_dict.contains_forces_forced_newline()
+        )
+
+    def serialize(self, ctx: SerializationCtx) -> str:
         out = self.name
+
+
+        base_ctx_child = ctx.mutate_for_indentation()
+
         if self.attached_params is not None:
-            out += self.attached_params.serialize(indentation+1)
+            out += self.attached_params.serialize(base_ctx_child)
         if self.attached_list is not None:
-            out += self.attached_params.serialize(indentation+1)
+            out += self.attached_list.serialize(base_ctx_child)
         if self.attached_dict is not None:
-            out += self.attached_dict.serialize(indentation+1)
+            out += self.attached_dict.serialize(base_ctx_child)
         return out
 
 
     @classmethod
-    def Deserialize(cls, stream: StringIO) -> 'ProtoType':
-
+    def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
         name = ""
         while (c := stream.read(1)) in (ascii_letters + "_"):
             name += c
@@ -308,22 +441,22 @@ class ProtoType(ProtoNode):
         dIct = None
 
 
-        while c not in ('', ']', ')', '}', ','):
+        while c not in ('', ']', ')', '}', ',', ':', '#'):
             if c == '[':
                 assert lIst is None, ValueError("Multiple attached lists are not legal")
 
                 stream.seek(stream.tell() - 1)
-                lIst = ProtoList.Deserialize(stream)
+                lIst = ProtoList.Deserialize(stream, allow_comments=allow_comments)
             elif c == '(':
                 assert params is None, ValueError("Multiple attached params are not legal")
 
                 stream.seek(stream.tell() - 1)
-                params = ProtoList.Deserialize(stream)
+                params = ProtoList.Deserialize(stream, allow_comments=allow_comments)
             elif c == '{':
                 assert dIct is None, ValueError("Multiple attached dicts are not legal")
 
                 stream.seek(stream.tell() - 1)
-                dIct = ProtoDict.Deserialize(stream)
+                dIct = ProtoDict.Deserialize(stream, allow_comments=allow_comments)
             elif c not in whitespace:
                 raise ValueError(f"Unknown char found in Object: '{c}'")
  
@@ -334,24 +467,59 @@ class ProtoType(ProtoNode):
         return ProtoType(name, params, lIst, dIct)
             
 
+class ProtoComment(ProtoNode):
+    contents : str
+    def __init__(self, contents : str):
+        self.contents = contents
+
+    def style_comment(self) -> bool:
+        return True
+
+
+
+    @classmethod
+    def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
+        assert stream.read(1) == '#'
+
+
+        contents = ''
+
+        while (c := stream.read(1)) != '\n' and c != '':
+            contents += c
+
+        return ProtoComment(contents.strip())
+    
+    def serialize(self, ctx: SerializationCtx) -> str:
+        return f"# {self.contents}\n" 
 
 
 def identify_protonode(char : str) -> Type | None:
+    if char in "([":
+        return ProtoList
+    if char == "{":
+        return ProtoDict
+
     if char in whitespace:
         return None
     if char == '"':
         return ProtoString
-    if char in digits:
+    if char in digits + '-':
         return ProtoNumber
 
     if char in ascii_letters:
         return ProtoType
-    
+    if char == '#':
+        return ProtoComment
         
 if __name__ == "__main__":
-    i = StringIO("{1:true(){2:false}}")
+    i = StringIO("""{
+        1 : [1, 2, 3, 4, 5, 0b01001],
+        2: "as\\nd"
+        # Foo
+        # Bar
+        1:true(){2:false, 3:false}}""")
 
-    print(ProtoDict.Deserialize(i).serialize())
+    print(ProtoDict.Deserialize(i, allow_comments=True).serialize(SerializationCtx()))
     print([i.read()])
 
 
