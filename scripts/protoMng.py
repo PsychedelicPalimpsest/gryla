@@ -42,11 +42,12 @@ class SerializationCtx:
 
     INDENTATION_MULTIPLIER : int = 4
 
-
+    # This value tunes how the formatter determins when to
+    # make dicts and lists collapse onto a single line
     ONELINER_THRESHOLD : int = 4
 
     
-    # Parsing context vars
+    # ===== Formatting variable settings =====
 
     indentation_level : int = 0
     
@@ -63,6 +64,10 @@ class SerializationCtx:
         return (" " * (self.indentation_level * self.INDENTATION_MULTIPLIER) ) if self.DO_INDENTATION else ""
 
 
+class DeserializationError(Exception):
+    pass
+def SerializationError(Exception):
+    pass
 
 class ProtoNode:
     def __init__(self):
@@ -72,7 +77,7 @@ class ProtoNode:
     def determine_size(self) -> int:
         """ Gives a value used to determine formatting size """
         return 1
-    def contains_forces_forced_newline(self) -> bool:
+    def contains_forced_newline(self) -> bool:
         return False
 
     def style_comment(self) -> bool:
@@ -150,12 +155,13 @@ class ProtoString(ProtoNode):
 
         first = stream.read(1)
 
-        assert first == '"'
+        if first != '"':
+            raise DeserializationError("Unexpected start of string")
 
         isEscaped = False
         while '"' != (c := stream.read(1)) or isEscaped:
             if isEscaped and c not in cls.ESCAPE_DICT:
-                raise ValueError(f"Cannot parse string due to unknown escaped charicter: {c}")
+                raise DeserializationError(f"Cannot parse string due to unknown escaped charicter: {c}")
             
 
             raw += c
@@ -188,15 +194,15 @@ class ProtoNumber(ProtoNode):
         if raw.startswith('0x') or raw.startswith('0X'):
             for c in raw[2:]:
                 if c not in hexdigits + '_':
-                    raise ValueError(f"Invalid number in hex mode: {c}")
+                    raise DeserializationError(f"Invalid number in hex mode: {c}")
         elif raw.startswith('0b') or raw.startswith('0B'):
             for c in raw[2:]:
                 if c not in '01_':
-                    raise ValueError(f'Invalid number in binary mode: {c}')
+                    raise DeserializationError(f'Invalid number in binary mode: {c}')
         else:
             for c in raw:
                 if c not in digits + "-_.":
-                    raise ValueError(f'Invalid number in decimal mode: {c}')
+                    raise DeserializationError(f'Invalid number in decimal mode: {c}')
 
 
         return ProtoNumber(raw)
@@ -239,14 +245,14 @@ class ProtoList(ProtoNode):
     def determine_size(self) -> int:
         return max(1, len(self.contents)) + max((0, *(c.determine_size() for c in self.contents)))
 
-    def contains_forces_forced_newline(self) -> bool:
-        return any((type(c) is ProtoComment for c in self.contents))
+    def contains_forced_newline(self) -> bool:
+        return any((c.contains_forced_newline() for c in self.contents))
 
     def serialize(self, ctx: SerializationCtx) -> str:
         out = self.style.start_token()
 
         # Determine if a oneliner is required
-        if self.determine_size() <= ctx.ONELINER_THRESHOLD:
+        if self.determine_size() <= ctx.ONELINER_THRESHOLD and not self.contains_forced_newline():
             ctx = ctx.mutate_for_oneliner()
 
         had_previous_forced_nl = False
@@ -290,7 +296,7 @@ class ProtoList(ProtoNode):
         }.get(first)
 
         if style is None:
-            raise ValueError(f"Unknown begining token for list: {first}")
+            raise DeserializationError(f"Unknown begining token for list: {first}")
 
 
         ender = style.end_token()
@@ -313,7 +319,7 @@ class ProtoList(ProtoNode):
 
             while (c := stream.read(1)) != ender and c != ',':
                 if c not in whitespace:
-                    raise ValueError(f"Parsing error: {c}{stream.read()}")
+                    raise DeserializationError(f"Parsing error: {c}{stream.read()}")
             if c == ender:
                 break
         return ProtoList(contents, style) 
@@ -328,6 +334,9 @@ class _ProtoKV(ProtoNode):
 
     def determine_size(self) -> int:
         return max(self.key.determine_size(), self.value.determine_size())
+
+    def contains_forced_newline(self) -> bool:
+        return self.key.contains_forced_newline() or self.value.contains_forced_newline()
     
     @classmethod
     def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
@@ -347,11 +356,13 @@ class ProtoDict(ProtoList):
 
     @classmethod
     def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
-        assert stream.read(1) == '{'
+        if stream.read(1) != '{':
+            raise DeserializationError("Unexpected head of dict")
 
         contents = []
         while (c := stream.read(1)) != '}':
-            assert c != '', 'Unexpected EOF'
+            if c == '':
+                raise DeserializationError('Unexpected EOF')
 
             if c == ',':
                 continue
@@ -371,10 +382,13 @@ class ProtoDict(ProtoList):
                 continue
             
             while (c := stream.read(1)) != ':':
-                assert c in whitespace, f"Unexpected token {c}"
-                assert c != '', "Unexpected EOF"
+                if c not in whitespace:
+                    raise DeserializationError(f"Unexpected token {c}")
+                if c == '':
+                    raise DeserializationError("Unexpected EOF")
             while (v_id := identify_protonode(c := stream.read(1))) is None:
-                assert c != '', "Unexpected EOF"
+                if c == '':
+                    raise DeserializationError("Unexpected EOF")
             stream.seek(stream.tell() - 1)
 
             value : ProtoNode = v_id.Deserialize(stream)
@@ -407,11 +421,11 @@ class ProtoType(ProtoNode):
             +
             (self.attached_params.determine_size() if self.attached_params is not None else 0)
         )
-    def contains_forces_forced_newline(self) -> bool:
+    def contains_forced_newline(self) -> bool:
         return any(
-            self.attached_params is not None and self.attached_params.contains_forces_forced_newline(),
-            self.attached_list is not None and self.attached_list.contains_forces_forced_newline(),
-            self.attached_dict is not None and self.attached_dict.contains_forces_forced_newline()
+            self.attached_params is not None and self.attached_params.contains_forced_newline(),
+            self.attached_list is not None and self.attached_list.contains_forced_newline(),
+            self.attached_dict is not None and self.attached_dict.contains_forced_newline()
         )
 
     def serialize(self, ctx: SerializationCtx) -> str:
@@ -443,22 +457,25 @@ class ProtoType(ProtoNode):
 
         while c not in ('', ']', ')', '}', ',', ':', '#'):
             if c == '[':
-                assert lIst is None, ValueError("Multiple attached lists are not legal")
+                if lIst is not None:
+                    raise DeserializationError("Multiple attached lists are not legal")
 
                 stream.seek(stream.tell() - 1)
                 lIst = ProtoList.Deserialize(stream, allow_comments=allow_comments)
             elif c == '(':
-                assert params is None, ValueError("Multiple attached params are not legal")
+                if params is not None:
+                    raise DeserializationError("Multiple attached params are not legal")
 
                 stream.seek(stream.tell() - 1)
                 params = ProtoList.Deserialize(stream, allow_comments=allow_comments)
             elif c == '{':
-                assert dIct is None, ValueError("Multiple attached dicts are not legal")
+                if dIct is not None:
+                    raise DeserializationError("Multiple attached dicts are not legal")
 
                 stream.seek(stream.tell() - 1)
                 dIct = ProtoDict.Deserialize(stream, allow_comments=allow_comments)
             elif c not in whitespace:
-                raise ValueError(f"Unknown char found in Object: '{c}'")
+                raise DeserializationError(f"Unknown char found in Object: '{c}'")
  
             c = stream.read(1)
 
@@ -475,11 +492,14 @@ class ProtoComment(ProtoNode):
     def style_comment(self) -> bool:
         return True
 
+    def contains_forced_newline(self) -> bool:
+        return True
 
 
     @classmethod
     def Deserialize(cls, stream: StringIO, allow_comments=False) -> 'ProtoNode':
-        assert stream.read(1) == '#'
+        if stream.read(1) != '#':
+            raise DeserializationError("Unexpected head of ProtoComment")
 
 
         contents = ''
